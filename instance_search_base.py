@@ -6,25 +6,29 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 import torch
-import torchvision.models as models
+# import torchvision.models as models
 import torchvision.transforms as transforms
 
 from scipy.spatial.distance import cosine
 from tqdm import tqdm
+from PIL import Image
+
+from extractor import extractor_factory
 
 class InstanceSearch:
     def __init__(self, 
                  gallery_path: str, 
                  query_path: str, 
                  txt_path: str, 
-                 backbone: str = 'resnet', 
+                 backbone: str = 'resnet152', 
                  log_file: str = 'rankList.txt',
                  gallery_feature_file: str = "gallery_features.pkl", 
                  query_feature_file: str = "query_features.pkl",                  
-                 batch_size: int = 32, ):
-        assert backbone in ['resnet50','resnet101','resnet152','vgg16', 'vgg19'], f"Backbone {backbone} is not implemented!"
+                 batch_size: int = 64, ):
+        # assert backbone in ['resnet50','resnet101','resnet152','vgg16','vgg19'], f"Backbone {backbone} is not implemented!"
         if not os.path.exists(backbone):
             os.makedirs(backbone)
+        print(f"[backbone: {backbone}]")
 
         self.gallery_path = gallery_path
         self.query_path = query_path
@@ -36,21 +40,21 @@ class InstanceSearch:
         # set device
         if torch.backends.mps.is_available():
             self.device = torch.device("mps")
+            print("[device: mps]")
         elif torch.cuda.is_available():
             self.device = torch.device("cuda")
+            print("[device: gpu]")
         else:
             self.device = torch.device("cpu")
+            print("[device: cpu]")
         
-        self.model = self._load_model(backbone=backbone)
+        self.model, self.transform = self._load_model(backbone=backbone)
         self.bboxes = self._load_annotation()
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
 
         # log
         logging.basicConfig(filename=os.path.join(backbone, log_file), 
                             level=logging.INFO, 
+                            format='%(message)s',
                             filemode='w')
         
         # precomputed and save gallery/query features
@@ -59,24 +63,10 @@ class InstanceSearch:
 
     def _load_model(self, backbone):
         """ load pretrained model """
-        # model factory
-        if backbone == 'vgg16':
-            model = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
-        elif backbone == 'vgg19':
-            model = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1)
-        elif backbone == 'resnet50':
-            model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
-        elif backbone == 'resnet101':
-            model = models.resnet101(weights=models.ResNet101_Weights.IMAGENET1K_V2)
-        elif backbone == 'resnet152':
-            model = models.resnet152(weights=models.ResNet152_Weights.IMAGENET1K_V2)
-        else: 
-            raise ValueError(f"Backbone {backbone} is not implemented!")
-        
-        model = torch.nn.Sequential(*(list(model.children())[:-1]))
+        model, transforms = extractor_factory(backbone)
         model = model.to(self.device)
         model.eval()
-        return model
+        return model, transforms
     
     def _load_annotation(self):
         """ retrieve bounding boxes for all query images """
@@ -123,18 +113,16 @@ class InstanceSearch:
 
         for query_img_name in tqdm(img_names, desc="extract query features"):
             img_path = os.path.join(self.query_path, query_img_name)
-            img = cv2.imread(img_path)
-            assert img is not None, f'fail to load query image {query_img_name}!'
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = Image.open(img_path).convert('RGB')
             
             # extract instance features
             query_features = []
             for bbox in self.bboxes[query_img_name]:
                 x, y, w, h = bbox
-                instance = img[y:y+h, x:x+w]
-                instance = cv2.resize(instance, (224, 224))
+                instance = img.crop((x, y, x+w, y+h))
                 instance_tensor = self.transform(instance).unsqueeze(0).to(self.device)
                 
+                # inference
                 with torch.no_grad():
                     feature = self.model(instance_tensor)
                 query_features.append(feature.cpu().numpy().flatten())
@@ -151,18 +139,13 @@ class InstanceSearch:
         for i in tqdm(range(0, len(img_names), self.batch_size), desc="extract gallery features"):
             batch_names = img_names[i:i+self.batch_size]
             batch_images = []
-            valid_names = []
             
             # batch images
             for img_name in batch_names:
                 img_path = os.path.join(self.gallery_path, img_name)
-                img = cv2.imread(img_path)
-                if img is not None:
-                    # image preprocess
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    img = cv2.resize(img, (224, 224))  # 224x224
-                    batch_images.append(self.transform(img))
-                    valid_names.append(img_name)
+                img = Image.open(img_path).convert('RGB')
+                img = self.transform(img)
+                batch_images.append(img)
             
             if not batch_images:
                 continue
@@ -173,7 +156,7 @@ class InstanceSearch:
                 batch_features = self.model(batch_tensor)
             
             # save features
-            for j, img_name in enumerate(valid_names):
+            for j, img_name in enumerate(batch_names):
                 features[img_name] = batch_features[j].cpu().numpy().flatten()
         
         print(f"#gallery images: {len(features)}")
@@ -201,8 +184,8 @@ class InstanceSearch:
                 max_sim = 1 / (1 + min(dists))  # convert distance to similarity
             elif metric == 'cosine':
                 sims = [1 - cosine(q_feat, gallery_feat) for q_feat in query_instances]
-                max_sim = max(sims)
-                # max_sim = np.mean(sims)
+                # max_sim = max(sims)
+                max_sim = np.mean(sims)
             else: 
                 raise ValueError(f"Metric {metric} is not implemented!")
             gallery_index = int(gallery_name.split('.')[0])
@@ -226,7 +209,7 @@ class InstanceSearch:
 
         # log rank list
         rank_list = f'Q{query_index+1}: '
-        rank_list += ' '.join([str(j) for j in [idx for idx, sim in sorted_results]])
+        rank_list += ' '.join([str(j) for j in [idx for idx, _ in sorted_results]])
         logging.info(rank_list)
 
         return top_k_sorted_results
@@ -239,9 +222,15 @@ class InstanceSearch:
         assert top_k < len(self.gallery_features)
         assert top_n < len(self.query_features)
         sample_gallery = {}
-        for query_img_name, query_instances in tqdm(self.query_features.items(), desc='instance search'):
+        for i in tqdm(range(len(self.query_features))):
+            query_img_name = f'{i}.jpg'
+            query_instances = self.query_features[query_img_name]
             top_k_results = self.query(query_img_name, query_instances, top_k=top_k, metric=metric)
             sample_gallery.setdefault(query_img_name, top_k_results)
+
+        # for query_img_name, query_instances in tqdm(self.query_features.items(), desc='instance search'):
+        #     top_k_results = self.query(query_img_name, query_instances, top_k=top_k, metric=metric)
+        #     sample_gallery.setdefault(query_img_name, top_k_results)
 
         # visualization
         # self.visualize(sample_gallery, figname, top_k, top_n)
@@ -256,11 +245,13 @@ class InstanceSearch:
             query_img_name = f'{row}.jpg'
             query_img_path = os.path.join(self.query_path, query_img_name)
             query_img = cv2.imread(query_img_path)
+            query_img = cv2.cvtColor(query_img, cv2.COLOR_BGR2RGB)
 
             for bbox in self.bboxes[query_img_name]:
                 x, y, w, h = bbox
                 cv2.rectangle(query_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
             plt.subplot(top_n, top_k+1, (top_k+1)*row+1)
+            plt.title(f'{row}')
             plt.imshow(cv2.resize(query_img, (224, 224)))
             plt.axis('off')
             for col in range(1, top_k+1): 
@@ -268,6 +259,7 @@ class InstanceSearch:
                 gallery_similarity = sample_gallery[query_img_name][col-1][1]
                 gallery_img_path = os.path.join(self.gallery_path, f'{gallery_index}.jpg')
                 gallery_img = cv2.imread(gallery_img_path)
+                gallery_img = cv2.cvtColor(gallery_img, cv2.COLOR_BGR2RGB)
                 plt.subplot(top_n, top_k+1, (top_k+1)*row+col+1)
                 plt.title(f'{gallery_similarity:.4f}')
                 plt.imshow(cv2.resize(gallery_img, (224, 224)))

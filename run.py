@@ -1,7 +1,19 @@
 import argparse
-# from instance_search_v1 import InstanceSearch
-from instance_search_v1 import InstanceSearch
+from instance_search_base import InstanceSearch
+from instance_search_vgg import InstanceSearchVGG
+from instance_search_vit import InstanceSearchViT
 
+def instance_search_factory(method):
+    if method in ['resnet50', 'resnet101', 'resnet152', 
+                  'efficientnet_v2_s', 'efficientnet_v2_m', 'efficientnet_v2_l']:
+        searcher = InstanceSearch
+    elif method in ['vgg16', 'vgg19']: 
+        searcher = InstanceSearchVGG
+    elif method in ['vit_b_16']:
+        searcher = InstanceSearchViT
+    else: 
+        raise ValueError(f"Method {method} is not implemented!")
+    return searcher
 
 def main(args):
     # configuration
@@ -15,7 +27,8 @@ def main(args):
     figname = args.output
     
     # initialization
-    searcher = InstanceSearch(gallery_path, query_path, txt_path, backbone=backbone, batch_size=batch_size)
+    model = instance_search_factory(backbone)
+    searcher = model(gallery_path, query_path, txt_path, backbone=backbone, batch_size=batch_size)
 
     # instance search 
     sample_gallery = searcher.instance_search(top_k=top_k, top_n=top_n)
